@@ -1,0 +1,603 @@
+import sys
+import cv2
+import mediapipe as mp
+import numpy as np
+import pyautogui
+import keyboard
+import time
+import scipy.signal as sig
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+from PyQt5.QtGui import QPixmap, QImage
+
+# Colores en formato BGR (OpenCV)
+ROJO = (0, 0, 255)
+VERDE = (0, 255, 0)
+AZUL = (255, 0, 0)
+AMARILLO = (0, 255, 255)
+VIOLETA = (255, 0, 255)
+CIAN = (255, 255, 0)
+NARANJA = (0, 165, 255)
+MARRON = (19, 69, 139)
+
+# ==============================
+# CONFIGURACIÓN GLOBAL
+# ==============================
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0 # mas velocidad
+
+color_puntos = color_lineas = VERDE
+
+# Variables de Control
+BarraSens = 1
+mano_ventana = 0
+
+fc = 4
+ejecutando = False
+positions = []
+window_size_filtro = 15
+Fs = 100
+orden = 1
+
+
+# Estado de Clicks y Scroll
+FFD = FFI = 0
+tiempo_previo = time.time()
+tiempos_fps = []
+
+# Inicialización MediaPipe
+mp_drawing = mp.solutions.drawing_utils
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False, 
+    max_num_hands=1,     
+    min_detection_confidence=0.7
+)
+cap = cv2.VideoCapture()
+timer = QTimer()
+
+# ==============================
+# LÓGICA DE PROCESAMIENTO
+# ==============================
+
+import math
+
+class OneEuroFilter:
+    def __init__(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev = None
+        self.dx_prev = 0
+
+    def __call__(self, x, dt=1.0/30):
+        if self.x_prev is None:
+            self.x_prev = x
+            return x
+        
+        # Calcular velocidad y filtrar
+        dx = (x - self.x_prev) / dt
+        edx = self._low_pass(dx, self.dx_prev, self._alpha(dt, self.d_cutoff))
+        self.dx_prev = edx
+        
+        # Corte adaptativo
+        cutoff = self.min_cutoff + self.beta * abs(edx)
+        alpha = self._alpha(dt, cutoff)
+        
+        # Filtrar posición
+        x_filtered = self._low_pass(x, self.x_prev, alpha)
+        self.x_prev = x_filtered
+        return x_filtered
+
+    def _alpha(self, dt, cutoff):
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def _low_pass(self, x, x_prev, alpha):
+        return alpha * x + (1.0 - alpha) * x_prev
+
+# Inicializar uno para X y otro para Y
+# Configuración "Pesada" (Mucha estabilidad, más inercia)
+filtro_x = OneEuroFilter(min_cutoff=0.05, beta=0.001) 
+filtro_y = OneEuroFilter(min_cutoff=0.05, beta=0.001)
+
+
+def suavizar_pos(x, y):
+    x_filt = filtro_x(x)
+    y_filt = filtro_y(y)
+    return x_filt, y_filt
+
+
+def f_tecla(FF_val, boton, tecla):
+    global color_puntos, color_lineas
+
+    if FF_val == 0 and boton[0]:             
+        pyautogui.mouseDown(button=tecla)
+        return 1
+        
+    elif FF_val == 1 and not boton[0]:         
+        pyautogui.mouseUp(button=tecla)      
+        return 0
+
+    elif boton[1] == 1:
+        pyautogui.click(button=tecla, clicks=2)    
+        
+    return FF_val
+    
+
+def mouse_ubicacion(hl):
+    mouse_x, mouse_y = int(hl.landmark[0].x * 640), int(hl.landmark[0].y * 480)
+    mouse_x, mouse_y = suavizar_pos((mouse_x), (mouse_y))
+    
+    return mouse_x, mouse_y
+    
+
+bi2_ant = 0
+def mouse_gesto_operacion(hl):   
+    global bi2_ant
+
+    bi1 = hl.landmark[8].y > hl.landmark[5].y    
+    bi2 = hl.landmark[16].y > hl.landmark[13].y
+
+    bd1 = hl.landmark[12].y > hl.landmark[9].y
+    bd2 = hl.landmark[20].y > hl.landmark[17].y
+
+    # Detectar flanco 0 -> 1
+    if bi2 == 1 and bi2_ant == 0:
+        salida_bi2 = 1
+    else:
+        salida_bi2 = 0
+
+    # Guardar estado anterior
+    bi2_ant = bi2  
+
+    return (bi1, salida_bi2), (bd1, bd2)
+
+
+def Deteccion_mano_openCV(frame):
+    frame = cv2.flip(cv2.resize(frame, (640, 480)), 1)
+    coord_mano = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))    
+    return coord_mano, frame # Retornamos también el frame procesado
+
+
+def Deteccion_gestos(hl):
+    mouse_x, mouse_y = mouse_ubicacion(hl)
+    BI,BD = mouse_gesto_operacion(hl)
+    scroll,estado_scroll = mouse_gesto_operacion_scroll(hl)
+    
+    return BI,BD,mouse_x, mouse_y,scroll,estado_scroll
+
+
+def mouse_virtual(mouse_X ,mouse_Y , BD, BI,scroll,estado_scroll, sensibilidad,mano):
+    global FFD,FFI, BarraSens
+    sw, sh = pyautogui.size()
+
+    Sens0 = 3.4
+    deltaSens = 2/5
+    
+    sensibilidad = Sens0 + deltaSens*BarraSens   
+    
+    y = int((mouse_Y - 320) * sensibilidad * sh / 480)
+
+    if mano_ventana == 0:
+        x = int((mouse_X - 426) * sensibilidad * sw / 640) 
+    else:
+        x = int(mouse_X * sensibilidad * sw / 640)
+
+    try: pyautogui.moveTo(x, y, _pause=False)
+    except: pass
+
+    pyautogui.scroll(100*scroll)
+
+    if estado_scroll == 0:
+        FFD = f_tecla(FFD, BD, 'right')
+        FFI = f_tecla(FFI, BI, 'left')
+
+    
+estado_scroll = valor_anterior_y = 0
+def mouse_gesto_operacion_scroll(hl):
+    global estado_scroll, valor_anterior_y  
+    scroll = 0
+
+    gesto_estado_subir = (abs(hl.landmark[8].x - hl.landmark[13].x)*640 < 70) and estado_scroll == 0
+    gesto_estado_bajar = (abs(hl.landmark[5].y - hl.landmark[8].y)*480 < 70) and estado_scroll == 0
+    gesto_estado_reposo = (abs(hl.landmark[0].y - hl.landmark[9].y)/5) < abs(hl.landmark[17].x - hl.landmark[5].x)
+
+    if gesto_estado_subir:  estado_scroll = 1        
+    if gesto_estado_bajar:  estado_scroll = 2       
+    if gesto_estado_reposo: estado_scroll = 0
+                
+    if (hl.landmark[8].y - valor_anterior_y)*480 > 5 and estado_scroll == 1:
+        valor_anterior_y = hl.landmark[8].y        
+        scroll = 1
+
+    if (valor_anterior_y - hl.landmark[8].y)*480 > 5 and estado_scroll == 1:
+        valor_anterior_y = hl.landmark[8].y
+        scroll = 0
+
+    if (hl.landmark[8].y - valor_anterior_y)*480 > 5 and estado_scroll == 2:
+        valor_anterior_y = hl.landmark[8].y              
+        scroll = 0
+
+    if (valor_anterior_y - hl.landmark[8].y)*480 > 5 and estado_scroll == 2:
+        valor_anterior_y = hl.landmark[8].y                
+        scroll = -1
+        
+    return scroll, estado_scroll
+
+
+mano_camara = 0
+def feedback(frame, coord_mano):
+    global mano_camara
+    
+    if coord_mano and coord_mano.multi_hand_landmarks:
+        for hand_landmarks in coord_mano.multi_hand_landmarks:
+            mp_drawing.draw_landmarks(
+                frame, 
+                hand_landmarks, 
+                mp_hands.HAND_CONNECTIONS,
+                landmark_drawing_spec=mp_drawing.DrawingSpec(
+                    color=color_puntos, thickness=2, circle_radius=4
+                ),
+                connection_drawing_spec=mp_drawing.DrawingSpec(
+                    color=color_lineas, thickness=3
+                )
+            )
+        label = coord_mano.multi_handedness[0].classification[0].label
+
+        mano_camara = int(label == "Left")
+            
+    # Conversión para mostrar en QLabel de PyQt5
+    alto, ancho, canales = frame.shape
+    paso = canales * ancho
+    q_img = QImage(frame.data, ancho, alto, paso, QImage.Format_BGR888)
+    lbl_logo.setPixmap(QPixmap.fromImage(q_img).scaled(lbl_logo.width(), lbl_logo.height(), Qt.KeepAspectRatio))
+
+
+def color_manos(BD, BI, scroll, estado_scroll):    
+    global color_puntos, color_lineas
+
+    if mano_camara != mano_ventana:
+        actualizar_texto("CAMBIAR MANO")
+    
+    elif BD[0] == 1:
+        color_puntos = color_lineas = AZUL  
+        actualizar_texto("CLICK DERECHO")
+
+    elif BI[1] == 1:
+        color_puntos = color_lineas = CIAN  
+        actualizar_texto("DOBLE CLICK IZQUIERDO")
+
+    elif BI[0] == 1:
+        color_puntos = color_lineas = ROJO  
+        actualizar_texto("CLICK IZQUIERDO")
+
+    elif scroll == 1:
+        color_puntos = color_lineas = NARANJA  
+        actualizar_texto("SUBIENDO")
+
+    elif scroll == -1:
+        color_puntos = color_lineas = VIOLETA 
+        actualizar_texto("BAJANDO")
+
+    elif estado_scroll == 1:
+        color_puntos = color_lineas = MARRON  
+        actualizar_texto("ESTADO SUBIR")
+
+    elif estado_scroll == 2:
+        color_puntos = color_lineas = AMARILLO  
+        actualizar_texto("ESTADO BAJAR")
+
+    else:
+        color_puntos = color_lineas = VERDE  
+        actualizar_texto("ESPERA")
+        
+          
+def procesar_loop():  
+    ret, frame = cap.read()
+    if not ret: 
+        return    
+   
+    coord_mano, frame_procesado = Deteccion_mano_openCV(frame)
+
+    if coord_mano.multi_hand_landmarks:
+        hl = coord_mano.multi_hand_landmarks[0]
+        BI, BD, mouse_X, mouse_Y, scroll, estado_scroll = Deteccion_gestos(hl)      
+        mouse_virtual(mouse_X, mouse_Y, BD, BI, scroll, estado_scroll, BarraSens, mano_ventana)
+        color_manos( BD, BI, scroll, estado_scroll)
+    
+    feedback(frame_procesado, coord_mano)
+
+
+# ==============================
+# CONTROL DE UI Y RECURSOS
+# ==============================
+def apagar_recursos():
+    global ejecutando
+    ejecutando = False
+    timer.stop()
+    if cap.isOpened(): 
+        cap.release()
+    
+    # Restaurar el logo original al apagar
+    pix = QPixmap("mouse virtual logo.jpg")
+    if not pix.isNull(): lbl_logo.setPixmap(pix.scaled(200, 150, Qt.KeepAspectRatio))
+    boton_inicio.setText("Iniciar")
+
+
+def iniciar_programa():
+    global ejecutando, tiempo_previo, positions, tiempos_fps
+    if not ejecutando:
+        cap.open(0, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            return QMessageBox.critical(None, "Error", "Cámara no disponible")
+        ejecutando = True
+        boton_inicio.setText("Pausar")
+        timer.start(1)
+        positions, tiempos_fps = [], []
+        tiempo_previo = time.time()
+    else:
+        apagar_recursos()
+
+
+def cerrar_aplicacion(event):
+    apagar_recursos()
+    hands.close()
+    event.accept()
+
+
+def detener_con_esc():
+    if ejecutando:
+        apagar_recursos()
+
+
+
+def actualizar_texto(mensaje):
+    lbl_estado.setText(mensaje)
+
+# ==============================
+# SETUP DE PYQT5
+# ==============================
+app = QApplication.instance() or QApplication(sys.argv)
+
+ventana_ui = QWidget()
+ventana_ui.setWindowTitle("Control Gestual")
+ventana_ui.setFixedSize(550, 650)   # ← NUEVA ALTURA
+
+ventana_ui.closeEvent = cerrar_aplicacion
+
+# CAPTURAR ESC
+def keyPressEvent(event):
+    if event.key() == Qt.Key_Escape:
+        detener_con_esc()
+
+ventana_ui.keyPressEvent = keyPressEvent
+
+# ==============================
+# LAYOUT PRINCIPAL
+# ==============================
+layout = QVBoxLayout()
+layout.setSpacing(10)
+layout.setContentsMargins(12,12,12,12)
+
+# ==============================
+# LABEL VIDEO / LOGO
+# ==============================
+lbl_logo = QLabel()
+
+pix = QPixmap("mouse virtual logo.jpg")
+
+if not pix.isNull():
+    lbl_logo.setPixmap(
+        pix.scaled(
+            180, 120,
+            Qt.KeepAspectRatio
+        )
+    )
+
+lbl_logo.setAlignment(Qt.AlignCenter)
+
+# MÁS CHICO
+lbl_logo.setMinimumSize(420, 260)
+
+lbl_logo.setStyleSheet("""
+background-color: #222;
+border: 1px solid #444;
+""")
+
+# ==============================
+# LABEL ESTADO
+# ==============================
+lbl_estado = QLabel("Esperando...")
+
+lbl_estado.setAlignment(Qt.AlignCenter)
+
+lbl_estado.setStyleSheet("""
+font-size: 16px;
+font-weight: bold;
+color: #00FF00;
+background-color: #111;
+padding: 4px;
+""")
+
+# ==============================
+# BOTÓN INICIO
+# ==============================
+boton_inicio = QPushButton("Iniciar")
+
+# MÁS BAJO
+boton_inicio.setFixedHeight(40)
+
+boton_inicio.setStyleSheet("""
+font-size: 16px;
+font-weight: bold;
+""")
+
+boton_inicio.clicked.connect(
+    iniciar_programa
+)
+
+# ==============================
+# TOGGLE MANO
+# ==============================
+toggle_mano = QPushButton("MANO DERECHA")
+
+toggle_mano.setCheckable(True)
+
+# MÁS CHICO
+toggle_mano.setFixedHeight(50)
+
+toggle_mano.setStyleSheet("""
+
+QPushButton {
+    font-size: 18px;
+    font-weight: bold;
+    background-color: #1E88E5;
+    color: white;
+    border-radius: 10px;
+    padding: 6px;
+}
+
+QPushButton:checked {
+    background-color: #8E24AA;
+}
+
+""")
+
+# FUNCIÓN TOGGLE
+def cambiar_mano():
+
+    global mano_ventana
+
+    if toggle_mano.isChecked():
+
+        mano_ventana = 1
+        toggle_mano.setText("MANO IZQUIERDA")
+
+    else:
+
+        mano_ventana = 0
+        toggle_mano.setText("MANO DERECHA")
+
+toggle_mano.clicked.connect(
+    cambiar_mano
+)
+
+# ==============================
+# SLIDER SENSIBILIDAD
+# ==============================
+sld_sens = QSlider(Qt.Horizontal)
+
+sld_sens.setRange(1, 5)
+sld_sens.setValue(BarraSens)
+
+sld_sens.setStyleSheet("""
+
+QSlider::groove:horizontal {
+    background: #444;
+    height: 10px;
+    border-radius: 5px;
+}
+
+QSlider::handle:horizontal {
+    background: #00FFAA;
+    width: 28px;
+    margin: -6px 0;
+    border-radius: 14px;
+}
+
+""")
+
+sld_sens.valueChanged.connect(
+    lambda v: globals().update(
+        BarraSens=v
+    )
+)
+
+# ==============================
+# LABELS CONFIG
+# ==============================
+lbl_sens = QLabel("Sensibilidad")
+
+lbl_sens.setStyleSheet("""
+font-size: 16px;
+font-weight: bold;
+""")
+
+lbl_cam = QLabel("Vista de Cámara:")
+
+# MÁS CHICO
+lbl_cam.setStyleSheet("""
+font-size: 24px;
+font-weight: bold;
+""")
+
+# ==============================
+# BOTÓN HELP
+# ==============================
+boton_help = QPushButton("HELP")
+
+# MÁS BAJO
+boton_help.setFixedHeight(50)
+
+boton_help.setStyleSheet("""
+
+QPushButton {
+    font-size: 18px;
+    font-weight: bold;
+    background-color: #455A64;
+    color: white;
+    border-radius: 10px;
+    padding: 6px;
+}
+
+QPushButton:hover {
+    background-color: #546E7A;
+}
+
+""")
+
+# FUNCIÓN ABRIR PDF
+def abrir_help():
+    import os
+
+    ruta_pdf = "manual.pdf"   # nombre del PDF
+    if os.path.exists(ruta_pdf):
+        os.startfile(ruta_pdf)
+
+    # Abrir video
+    ruta_video = "tutorial.mp4"
+    if os.path.exists(ruta_video):
+        os.startfile(ruta_video)
+
+boton_help.clicked.connect(
+    abrir_help
+)
+
+# ==============================
+# ORGANIZACIÓN LAYOUT
+# ==============================
+layout.addWidget(boton_inicio)
+layout.addSpacing(10)
+layout.addWidget(boton_help)
+layout.addSpacing(15)
+layout.addWidget(toggle_mano)
+layout.addSpacing(15)
+layout.addWidget(lbl_sens)
+layout.addWidget(sld_sens)
+layout.addSpacing(15)
+layout.addWidget(lbl_cam)
+layout.addWidget(lbl_logo)
+layout.addWidget(lbl_estado)
+
+# ==============================
+# CONFIG FINAL
+# ==============================
+ventana_ui.setLayout(layout)
+
+timer.timeout.connect(
+    procesar_loop
+)
+
+ventana_ui.show()
+app.exec_()
